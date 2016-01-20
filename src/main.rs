@@ -112,14 +112,22 @@ fn main() {
 
         thread::spawn(move || {
 
-            let cli_out = format!("[{}] {} [{}]", Style::new().bold().paint(song.user.username.clone()), Colour::Blue.paint(song.title.clone()), format_time(song.duration));
+            let cli_out = match cfg!(target_os = "unix") {
+                true => format!("[{}] {} [{}]", Style::new().bold().paint(song.user.username.clone()), Colour::Blue.paint(song.title.clone()), format_time(song.duration)),
+                false => format!("[{}] {} [{}]",song.user.username, song.title, format_time(song.duration))
+            };
 
             match resolve_file(&file_path){
                 Ok(_) => {
-                    println!("Already Downloaded: {}", cli_out);
+                    //println!("Already Downloaded: {}", cli_out);
                 },
                 Err(_) => {
-                    println!("Downloading: {} to: {}", cli_out, Colour::Green.paint(file_path));
+
+                    if cfg!(target_os = "unix") {
+                        println!("Downloading: {} to: {}", cli_out, Colour::Green.paint(file_path));
+                    } else {
+                        println!("Downloading: {} to: {}", cli_out, file_path);
+                    }
                     download_song(&access_token, &song);
                     println!("Finished Downloading: {}", cli_out);
                 }
@@ -162,7 +170,10 @@ fn prompt_and_save_auth_info() -> Settings {
     let mut f = File::create("auth_info").unwrap();
     f.write_all(file_contents.as_bytes()).unwrap();
 
-    fs::remove_file("auth_response").unwrap();
+    match resolve_file("auth_response") {
+        Ok(_) => fs::remove_file("auth_response").unwrap(),
+        Err(_) => ()
+    }
 
     auth_info
 }
@@ -239,8 +250,23 @@ fn download_to_file(url: &str, file_name: &str) {
 
 }
 
+#[cfg(unix)]
 fn get_song_path(song: &SoundObject) -> String {
     format!("{}/{} - {}.mp3", &song.created_at[0..7], song.user.username, song.title.replace("/", ""))
+}
+
+#[cfg(windows)]
+fn get_song_path(song: &SoundObject) -> String {
+    let chars_to_trim = &["\\", "|", "/", "<", ">", ":", "\"", "?", "*"];
+    let mut trimmed_title = song.title.clone();
+    let mut trimmed_username = song.user.username.clone();
+
+    for bad_char in chars_to_trim {
+        trimmed_title = trimmed_title.replace(bad_char, "");
+        trimmed_username = trimmed_username.replace(bad_char, "");
+    }
+
+    format!("{}\\{} - {}.mp3", &song.created_at[0..7].replace("/", "\\"), trimmed_username, trimmed_title)
 }
 
 fn create_parent_dirs(file: &str) {
@@ -305,7 +331,7 @@ fn get_songs(access_token: &str, duration_limit_ms: i64) -> Vec<SoundObject> {
             processed_songs.insert(collection_info.origin.id);
             songs.push(collection_info.origin);
         } else {
-            println!("Skipping: [{}] {} [{}] ({})", Style::new().bold().paint(collection_info.origin.user.username), Colour::Blue.paint(collection_info.origin.title), format_time(collection_info.origin.duration), collection_info.origin.kind);
+            //println!("Skipping: [{}] {} [{}] ({})", Style::new().bold().paint(collection_info.origin.user.username), Colour::Blue.paint(collection_info.origin.title), format_time(collection_info.origin.duration), collection_info.origin.kind);
         }
     }
 
