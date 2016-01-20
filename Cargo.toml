@@ -1,0 +1,13 @@
+[package]
+name = "rustcloud"
+version = "0.0.1"
+authors = ["Peter Lesty <peter@parashift.com.au"]
+description = "Downloads tracks from soundcloud"
+
+[dependencies]
+hyper = "0.7.2"
+rustc-serialize = "0.3"
+ansi_term = "0.7"
+id3 = "*"
+chrono = "*"
+filetime = "0.1.9"
