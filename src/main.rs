@@ -10,7 +10,6 @@ use std::path::Path;
 use std::io::{self, Write, Read, Error, ErrorKind, Result};
 use std::fs::{self,File};
 use std::collections::HashSet;
-use std::thread;
 use std::sync::mpsc::channel;
 use threadpool::ThreadPool;
 
