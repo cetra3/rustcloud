@@ -8,6 +8,7 @@ dependencies = [
  "hyper 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "id3 0.1.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustc-serialize 0.3.16 (registry+https://github.com/rust-lang/crates.io-index)",
+ "threadpool 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -377,6 +378,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
  "rand 0.3.13 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
+
+[[package]]
+name = "threadpool"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "time"

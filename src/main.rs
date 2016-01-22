@@ -4,12 +4,15 @@ extern crate ansi_term;
 extern crate id3;
 extern crate chrono;
 extern crate filetime;
+extern crate threadpool;
 
 use std::path::Path;
 use std::io::{self, Write, Read, Error, ErrorKind, Result};
 use std::fs::{self,File};
 use std::collections::HashSet;
 use std::thread;
+use std::sync::mpsc::channel;
+use threadpool::ThreadPool;
 
 use hyper::Client;
 use hyper::header::ContentType;
@@ -45,7 +48,7 @@ pub struct SoundObject  {
 
 #[derive(RustcDecodable, RustcEncodable)]
 pub struct CollectionInfo {
-    origin: SoundObject
+    origin: Option<SoundObject>
 }
 
 
@@ -102,7 +105,16 @@ fn main() {
 
     let songs = get_songs(&auth.access_token, duration_limit_ms);
 
-    let handles: Vec<_> = songs.into_iter().map(|song| {
+    let num_songs = songs.len();
+
+
+    println!("Checking {} songs", num_songs);
+
+    let pool = ThreadPool::new(4);
+
+    let (tx, rx) = channel();
+
+    for song in songs.into_iter() {
 
         let access_token = auth.access_token.clone();
 
@@ -110,34 +122,33 @@ fn main() {
         let file_path = get_song_path(&song);
         create_parent_dirs(&file_path);
 
-        thread::spawn(move || {
+        let tx = tx.clone();
 
-            let cli_out = match cfg!(target_os = "unix") {
-                true => format!("[{}] {} [{}]", Style::new().bold().paint(song.user.username.clone()), Colour::Blue.paint(song.title.clone()), format_time(song.duration)),
-                false => format!("[{}] {} [{}]",song.user.username, song.title, format_time(song.duration))
-            };
+        pool.execute(move || {
+
+            let cli_out = display_song(&song);
 
             match resolve_file(&file_path){
                 Ok(_) => {
-                    //println!("Already Downloaded: {}", cli_out);
+                    println!("Already Downloaded: {}", cli_out);
                 },
                 Err(_) => {
 
-                    if cfg!(target_os = "unix") {
-                        println!("Downloading: {} to: {}", cli_out, Colour::Green.paint(file_path));
-                    } else {
-                        println!("Downloading: {} to: {}", cli_out, file_path);
-                    }
+                    println!("Downloading: {} to: {}", cli_out, file_path);
+
                     download_song(&access_token, &song);
                     println!("Finished Downloading: {}", cli_out);
                 }
             };
-        })
-    }).collect();
 
-    for h in handles {
-        h.join().unwrap();
+            tx.send(()).unwrap();
+        });
     }
+
+    for _ in 0..num_songs {
+        rx.recv().unwrap();
+    }
+
 }
 
 fn get_or_prompt_auth_info() -> Settings {
@@ -251,22 +262,46 @@ fn download_to_file(url: &str, file_name: &str) {
 }
 
 #[cfg(unix)]
-fn get_song_path(song: &SoundObject) -> String {
-    format!("{}/{} - {}.mp3", &song.created_at[0..7], song.user.username, song.title.replace("/", ""))
+fn display_song(song: &SoundObject) -> String {
+    format!("[{}] {} [{}]", Style::new().bold().paint(song.user.username.clone()), Colour::Blue.paint(song.title.clone()), format_time(song.duration))
 }
 
 #[cfg(windows)]
+fn display_song(song: &SoundObject) -> String {
+    format!("[{}] {} [{}]",song.user.username, song.title, format_time(song.duration))
+}
+
 fn get_song_path(song: &SoundObject) -> String {
     let chars_to_trim = &["\\", "|", "/", "<", ">", ":", "\"", "?", "*"];
-    let mut trimmed_title = song.title.clone();
-    let mut trimmed_username = song.user.username.clone();
 
-    for bad_char in chars_to_trim {
-        trimmed_title = trimmed_title.replace(bad_char, "");
-        trimmed_username = trimmed_username.replace(bad_char, "");
+    let trimmed_title = remove_chars(chars_to_trim, &song.title);
+    let trimmed_username = remove_chars(chars_to_trim, &song.user.username);
+
+    let seperator = match cfg!(target_os = "windows") {
+        true => "\\",
+        false => "/"
+    };
+
+    let year = &song.created_at[0..4];
+    let month = &song.created_at[5..7];
+
+    format!("{}{}{}{}{} - {}.mp3", year, seperator, month, seperator, trimmed_username, trimmed_title)
+}
+
+fn remove_chars(needles: &[&str], haystack: &str) -> String {
+
+    let mut result = String::new();
+    let mut last_end = 0;
+
+    for needle in needles {
+        for (start, part) in haystack.match_indices(needle) {
+            result.push_str(unsafe { haystack.slice_unchecked(last_end, start) });
+            last_end = start + part.len();
+        }
     }
 
-    format!("{}\\{} - {}.mp3", &song.created_at[0..7].replace("/", "\\"), trimmed_username, trimmed_title)
+    result.push_str(unsafe { haystack.slice_unchecked(last_end, haystack.len()) });
+    result
 }
 
 fn create_parent_dirs(file: &str) {
@@ -304,10 +339,12 @@ fn resolve_file(search_path: &str) -> Result<File> {
 fn get_songs(access_token: &str, duration_limit_ms: i64) -> Vec<SoundObject> {
 
     //max limit is 319???
-    let activity_url = format!("https://api.soundcloud.com/me/activities?limit=319&oauth_token={}", access_token);
+    let activity_url = format!("https://api.soundcloud.com/me/activities?limit=200&oauth_token={}", access_token);
 
     //Filter out duplicates
     let mut processed_songs: HashSet<i64> = HashSet::new();
+
+    println!("Downloading Activity Feed");
 
     // Create a client.
     let client = Client::new();
@@ -320,18 +357,26 @@ fn get_songs(access_token: &str, duration_limit_ms: i64) -> Vec<SoundObject> {
     let mut body = String::new();
     res.read_to_string(&mut body).unwrap();
 
-
-    let activity_feed: Activities = json::decode(&*body).unwrap();
+    let activity_feed: Activities = match json::decode(&*body) {
+        Ok(json) => json,
+        Err(why) => panic!("Could not parse activity feed: {:?}", why)
+    };
 
     let mut songs: Vec<SoundObject> = Vec::new();
 
     for collection_info in activity_feed.collection {
-        if collection_info.origin.duration >= duration_limit_ms && !processed_songs.contains(&collection_info.origin.id) && collection_info.origin.kind == "track" {
 
-            processed_songs.insert(collection_info.origin.id);
-            songs.push(collection_info.origin);
-        } else {
-            //println!("Skipping: [{}] {} [{}] ({})", Style::new().bold().paint(collection_info.origin.user.username), Colour::Blue.paint(collection_info.origin.title), format_time(collection_info.origin.duration), collection_info.origin.kind);
+        match collection_info.origin {
+            Some(song) => {
+                if song.duration >= duration_limit_ms && !processed_songs.contains(&song.id) && song.kind == "track" {
+
+                    processed_songs.insert(song.id);
+                    songs.push(song);
+                } else {
+                    println!("Skipping: {} ({})", display_song(&song), song.kind);
+                }
+            }
+            None => ()
         }
     }
 
