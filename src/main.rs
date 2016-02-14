@@ -16,10 +16,14 @@ use threadpool::ThreadPool;
 use hyper::Client;
 use hyper::header::ContentType;
 use rustc_serialize::json;
-use ansi_term::{Style,Colour};
 use id3::Tag;
+use id3::frame::PictureType::Other;
 use chrono::Local;
 use filetime::FileTime;
+
+#[cfg(unix)]
+use ansi_term::{Style,Colour};
+
 
 #[derive(RustcDecodable, RustcEncodable)]
 pub struct AuthReponse  {
@@ -41,6 +45,7 @@ pub struct SoundObject  {
     permalink_url: String,
     downloadable: Option<bool>,
     user: UserDetails,
+    artwork_url: Option<String>,
     created_at: String,
     kind: String
 }
@@ -226,8 +231,27 @@ fn download_song(access_token: &str, song: &SoundObject) {
     let mut tag = Tag::with_version(4);
     tag.set_title(song.title.clone());
     tag.set_artist(song.user.username.clone());
-    tag.write_to_path(file_name).unwrap();
 
+    match song.artwork_url {
+       Some(ref url) => {
+           let larger_url = url.replace("large.jpg", "t500x500.jpg");
+
+           // Create a client.
+           let client = Client::new();
+           let mut res = client.get(&*larger_url)
+                               .send()
+                               .unwrap();
+
+           let mut buf: Vec<u8> = Vec::new();
+
+           io::copy(&mut res, &mut buf).unwrap();
+
+           tag.add_picture("image/jpeg", Other, buf);
+       },
+       None => ()
+    };
+
+    tag.write_to_path(file_name).unwrap();
 }
 
 fn download_to_file(url: &str, file_name: &str) {
@@ -241,22 +265,7 @@ fn download_to_file(url: &str, file_name: &str) {
                         .send()
                         .unwrap();
 
-
-    let mut buffer = [0; 10240];
-
-    loop {
-        match res.read(&mut buffer[..]) {
-            Ok(size) => {
-
-                if size == 0 {
-                    break;
-                }
-
-                file_handle.write_all(&buffer[0..size]).unwrap()
-            },
-            Err(_) => break
-        }
-    }
+    io::copy(&mut res, &mut file_handle).unwrap();
 
 }
 
