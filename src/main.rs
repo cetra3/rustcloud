@@ -17,7 +17,7 @@ use hyper::Client;
 use hyper::header::ContentType;
 use rustc_serialize::json;
 use id3::Tag;
-use id3::frame::PictureType::Other;
+use id3::frame::PictureType::CoverFront;
 use chrono::Local;
 use filetime::FileTime;
 
@@ -228,7 +228,7 @@ fn download_song(access_token: &str, song: &SoundObject) {
 
     download_to_file(&url, &file_name);
 
-    let mut tag = Tag::with_version(4);
+    let mut tag = Tag::with_version(3);
     tag.set_title(song.title.clone());
     tag.set_artist(song.user.username.clone());
 
@@ -246,10 +246,14 @@ fn download_song(access_token: &str, song: &SoundObject) {
 
            io::copy(&mut res, &mut buf).unwrap();
 
-           tag.add_picture("image/jpeg", Other, buf);
+           tag.add_picture("image/jpeg", CoverFront, buf);
        },
        None => ()
     };
+
+    let album = format!("{} - {}", song.user.username, song.title);
+
+    tag.set_album(album);
 
     tag.write_to_path(file_name).unwrap();
 }
