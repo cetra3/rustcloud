@@ -1,6 +1,6 @@
 [package]
 name = "rustcloud"
-version = "0.0.2"
+version = "0.0.3"
 authors = ["Peter Lesty <peter@parashift.com.au"]
 description = "Downloads tracks from soundcloud"
 
@@ -12,3 +12,4 @@ id3 = "*"
 chrono = "*"
 filetime = "0.1.9"
 threadpool = "0.2.1"
+regex = "*"

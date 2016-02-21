@@ -5,6 +5,8 @@ extern crate id3;
 extern crate chrono;
 extern crate filetime;
 extern crate threadpool;
+extern crate regex;
+
 
 use std::path::Path;
 use std::io::{self, Write, Read, Error, ErrorKind, Result};
@@ -12,6 +14,7 @@ use std::fs::{self,File};
 use std::collections::HashSet;
 use std::sync::mpsc::channel;
 use threadpool::ThreadPool;
+use regex::Regex;
 
 use hyper::Client;
 use hyper::header::ContentType;
@@ -134,7 +137,7 @@ fn main() {
 
             match resolve_file(&file_path){
                 Ok(_) => {
-                    println!("Already Downloaded: {}", cli_out);
+                    println!("Already Downloaded: {} at: {}", cli_out, file_path);
                 },
                 Err(_) => {
 
@@ -284,10 +287,11 @@ fn display_song(song: &SoundObject) -> String {
 }
 
 fn get_song_path(song: &SoundObject) -> String {
-    let chars_to_trim = &["\\", "|", "/", "<", ">", ":", "\"", "?", "*"];
 
-    let trimmed_title = remove_chars(chars_to_trim, &song.title);
-    let trimmed_username = remove_chars(chars_to_trim, &song.user.username);
+    let re_trimmer = Regex::new("[\\|/<>:\"?*]").unwrap();
+
+    let trimmed_title = re_trimmer.replace_all(&*song.title, "");
+    let trimmed_username = re_trimmer.replace_all(&*song.user.username, "");
 
     let seperator = match cfg!(target_os = "windows") {
         true => "\\",
@@ -298,22 +302,6 @@ fn get_song_path(song: &SoundObject) -> String {
     let month = &song.created_at[5..7];
 
     format!("{}{}{}{}{} - {}.mp3", year, seperator, month, seperator, trimmed_username, trimmed_title)
-}
-
-fn remove_chars(needles: &[&str], haystack: &str) -> String {
-
-    let mut result = String::new();
-    let mut last_end = 0;
-
-    for needle in needles {
-        for (start, part) in haystack.match_indices(needle) {
-            result.push_str(unsafe { haystack.slice_unchecked(last_end, start) });
-            last_end = start + part.len();
-        }
-    }
-
-    result.push_str(unsafe { haystack.slice_unchecked(last_end, haystack.len()) });
-    result
 }
 
 fn create_parent_dirs(file: &str) {
