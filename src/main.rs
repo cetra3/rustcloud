@@ -1,6 +1,7 @@
 extern crate hyper;
+extern crate hyper_native_tls;
+extern crate term_painter;
 extern crate rustc_serialize;
-extern crate ansi_term;
 extern crate id3;
 extern crate chrono;
 extern crate filetime;
@@ -24,9 +25,11 @@ use id3::frame::PictureType::CoverFront;
 use chrono::Local;
 use filetime::FileTime;
 
-#[cfg(unix)]
-use ansi_term::{Style,Colour};
+use hyper::net::HttpsConnector;
+use hyper_native_tls::NativeTlsClient;
 
+use term_painter::ToStyle;
+use term_painter::Color::*;
 
 #[derive(RustcDecodable, RustcEncodable)]
 pub struct AuthReponse  {
@@ -133,18 +136,22 @@ fn main() {
 
         pool.execute(move || {
 
-            let cli_out = display_song(&song);
-
             match resolve_file(&file_path){
                 Ok(_) => {
-                    println!("Already Downloaded: {} at: {}", cli_out, file_path);
+                    print!("Already Downloaded: ");
+                    display_song(&song);
+                    print!(" at: {}\n", file_path);
                 },
                 Err(_) => {
 
-                    println!("Downloading: {} to: {}", cli_out, file_path);
+                    print!("Downloading: ");
+                    display_song(&song);
+                    print!(" to: {}\n", file_path);
 
                     download_song(&access_token, &song);
-                    println!("Finished Downloading: {}", cli_out);
+                    print!("Finished Downloading: ");
+                    display_song(&song);
+                    print!("\n");
                 }
             };
 
@@ -240,7 +247,7 @@ fn download_song(access_token: &str, song: &SoundObject) {
            let larger_url = url.replace("large.jpg", "t500x500.jpg");
 
            // Create a client.
-           let client = Client::new();
+           let client = get_client();
            let mut res = client.get(&*larger_url)
                                .send()
                                .unwrap();
@@ -266,7 +273,7 @@ fn download_to_file(url: &str, file_name: &str) {
     let mut file_handle = File::create(file_name.clone()).unwrap();
 
     // Create a client.
-    let client = Client::new();
+    let client = get_client();
 
     let mut res = client.get(url)
                         .send()
@@ -276,14 +283,8 @@ fn download_to_file(url: &str, file_name: &str) {
 
 }
 
-#[cfg(unix)]
-fn display_song(song: &SoundObject) -> String {
-    format!("[{}] {} [{}]", Style::new().bold().paint(song.user.username.clone()), Colour::Blue.paint(song.title.clone()), format_time(song.duration))
-}
-
-#[cfg(windows)]
-fn display_song(song: &SoundObject) -> String {
-    format!("[{}] {} [{}]",song.user.username, song.title, format_time(song.duration))
+fn display_song(song: &SoundObject) {
+    print!("[{}] {} [{}]", BrightGreen.bold().paint(song.user.username.clone()), BrightCyan.paint(song.title.clone()), BrightBlue.paint(format_time(song.duration)))
 }
 
 fn get_song_path(song: &SoundObject) -> String {
@@ -347,7 +348,7 @@ fn get_songs(access_token: &str, duration_limit_ms: i64) -> Vec<SoundObject> {
     println!("Downloading Activity Feed");
 
     // Create a client.
-    let client = Client::new();
+    let client = get_client();
 
     // Creating an outgoing request.
     let mut res = client.get(&activity_url)
@@ -373,7 +374,9 @@ fn get_songs(access_token: &str, duration_limit_ms: i64) -> Vec<SoundObject> {
                     processed_songs.insert(song.id);
                     songs.push(song);
                 } else {
-                    println!("Skipping: {} ({})", display_song(&song), song.kind);
+                    print!("Skipping: ");
+                    display_song(&song);
+                    print!(" ({})\n", song.kind);
                 }
             }
             None => ()
@@ -386,7 +389,7 @@ fn get_songs(access_token: &str, duration_limit_ms: i64) -> Vec<SoundObject> {
 fn get_and_save_auth_token(auth: Settings) -> AuthReponse {
 
     // Create a client.
-    let client = Client::new();
+    let client = get_client();
 
     let url = "https://api.soundcloud.com/oauth2/token";
 
@@ -411,5 +414,13 @@ fn get_and_save_auth_token(auth: Settings) -> AuthReponse {
     println!("Status:{}", res.status);
 
     return json::decode(&*body).unwrap();
+
+}
+
+fn get_client() -> Client {
+    let ssl = NativeTlsClient::new().unwrap();
+    let connector = HttpsConnector::new(ssl);
+
+    Client::with_connector(connector)
 
 }
