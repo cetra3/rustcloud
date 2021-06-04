@@ -1,50 +1,45 @@
-extern crate hyper;
-extern crate hyper_native_tls;
-extern crate term_painter;
-extern crate rustc_serialize;
-extern crate id3;
-extern crate chrono;
-extern crate filetime;
-extern crate threadpool;
-extern crate regex;
-
-
 use std::path::Path;
-use std::io::{self, Write, Read, Error, ErrorKind, Result};
-use std::fs::{self,File};
-use std::collections::HashSet;
-use std::sync::mpsc::channel;
-use threadpool::ThreadPool;
+
+use chrono::DateTime;
+use id3::frame::Picture;
+use id3::frame::PictureType;
 use regex::Regex;
+use std::collections::HashSet;
 
-use hyper::Client;
-use hyper::header::ContentType;
-use rustc_serialize::json;
-use id3::Tag;
-use id3::frame::PictureType::CoverFront;
+use futures::stream::{self, StreamExt, TryStreamExt};
+use tokio::fs::{self, File};
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufWriter;
+
+use anyhow::{anyhow, Error, Result};
+
 use chrono::Local;
-use filetime::FileTime;
+use id3::Tag;
 
-use hyper::net::HttpsConnector;
-use hyper_native_tls::NativeTlsClient;
+use serde::{Deserialize, Serialize};
 
-use term_painter::ToStyle;
 use term_painter::Color::*;
+use term_painter::ToStyle;
 
-#[derive(RustcDecodable, RustcEncodable)]
-pub struct AuthReponse  {
+#[derive(Deserialize, Serialize, Clone)]
+pub struct AuthReponse {
     access_token: String,
-    expires_in: i64
+    expires_in: i64,
+}
+#[derive(Deserialize, Serialize)]
+pub struct SavedAuthReponse {
+    res: AuthReponse,
+    date: DateTime<Local>,
 }
 
-#[derive(RustcDecodable, RustcEncodable)]
+#[derive(Serialize, Deserialize)]
 pub struct UserDetails {
     id: i64,
-    username: String
+    username: String,
 }
 
-#[derive(RustcDecodable, RustcEncodable)]
-pub struct SoundObject  {
+#[derive(Serialize, Deserialize)]
+pub struct SoundObject {
     id: i64,
     duration: i64,
     title: String,
@@ -52,80 +47,88 @@ pub struct SoundObject  {
     downloadable: Option<bool>,
     user: UserDetails,
     artwork_url: Option<String>,
+    download_url: Option<String>,
+    stream_url: Option<String>,
     created_at: String,
-    kind: String
+    kind: String,
 }
 
-#[derive(RustcDecodable, RustcEncodable)]
+#[derive(Serialize, Deserialize)]
 pub struct CollectionInfo {
-    origin: Option<SoundObject>
+    origin: Option<SoundObject>,
 }
 
-
-#[derive(RustcDecodable, RustcEncodable)]
-pub struct Activities  {
-    collection: Vec<CollectionInfo>
+#[derive(Serialize, Deserialize)]
+pub struct Activities {
+    collection: Vec<CollectionInfo>,
 }
 
-#[derive(RustcDecodable, RustcEncodable)]
+#[derive(Serialize, Deserialize)]
 pub struct Settings {
     username: String,
     password: String,
     client_id: String,
     client_secret: String,
-    duration_minutes: String
+    duration_minutes: String,
 }
 
-
-fn main() {
-
+#[tokio::main]
+async fn main() -> Result<(), Error> {
     let auth_info = get_or_prompt_auth_info();
 
     let duration_minutes: i64 = auth_info.duration_minutes.parse().unwrap();
 
-    let auth : AuthReponse = match resolve_file("auth_response") {
-        Ok(file) => {
-
-            let metadata = file.metadata().unwrap();
-
-            match read_file(file) {
-                Ok(contents) => match json::decode(&*contents) {
-                    Ok(json_contents) => {
-
-                        let json: AuthReponse = json_contents;
-
-                        let mtime = FileTime::from_last_modification_time(&metadata);
-                        let current_time = Local::now();
-
-                        match (json.expires_in + mtime.seconds_relative_to_1970() as i64) < current_time.timestamp() {
-                            true => get_and_save_auth_token(auth_info),
-                            false => json
-                        }
-                    },
-                    Err(_) => get_and_save_auth_token(auth_info)
-                },
-                Err(_) => panic!("Could not decode the auth_response file!")
-            }
-        },
-        Err(_) => get_and_save_auth_token(auth_info)
+    let auth = match get_auth_response().await {
+        Ok(val) => val,
+        Err(err) => {
+            println!("{}", err);
+            get_and_save_auth_token(auth_info).await?
+        }
     };
-
 
     let duration_limit_ms = duration_minutes * 60000;
 
-    let songs = get_songs(&auth.access_token, duration_limit_ms);
+    let songs = get_songs(&auth.access_token, duration_limit_ms).await?;
 
     let num_songs = songs.len();
 
-
     println!("Checking {} songs", num_songs);
 
-    let pool = ThreadPool::new(4);
+    for song in songs.iter() {
+        let file_path = get_song_path(&song);
+        create_parent_dirs(&file_path).await?;
+    }
 
-    let (tx, rx) = channel();
+    let stream = stream::iter(songs).map(|val| Ok(val) as Result<_, Error>);
+
+    let access_token = &*auth.access_token;
+
+    stream
+        .try_for_each_concurrent(4, |song| async move {
+            let file_path = get_song_path(&song);
+
+            if fs::metadata(&file_path).await.is_ok() {
+                print!("Already Downloaded: ");
+                display_song(&song);
+                println!(" at: {}", file_path);
+            } else {
+                print!("Downloading: ");
+                display_song(&song);
+                println!(" to: {}", file_path);
+
+                download_song(access_token, &song).await?;
+                print!("Finished Downloading: ");
+                display_song(&song);
+                println!();
+            }
+
+            Ok(())
+        })
+        .await?;
+
+    /*
 
     for song in songs.into_iter() {
-
         let access_token = auth.access_token.clone();
 
         //Create dirs before multi-thread to avoid conflicts
@@ -135,15 +138,13 @@ fn main() {
         let tx = tx.clone();
 
         pool.execute(move || {
-
-            match resolve_file(&file_path){
+            match resolve_file(&file_path) {
                 Ok(_) => {
                     print!("Already Downloaded: ");
                     display_song(&song);
                     print!(" at: {}\n", file_path);
-                },
+                }
                 Err(_) => {
-
                     print!("Downloading: ");
                     display_song(&song);
                     print!(" to: {}\n", file_path);
@@ -158,137 +159,140 @@ fn main() {
             tx.send(()).unwrap();
         });
     }
+    */
 
-    for _ in 0..num_songs {
-        rx.recv().unwrap();
+    Ok(())
+}
+
+async fn get_auth_response() -> Result<AuthReponse> {
+    let contents = fs::read_to_string("auth_response").await?;
+
+    let val: SavedAuthReponse = serde_json::from_str(&contents)?;
+
+    if (val.date.timestamp() + val.res.expires_in) < Local::now().timestamp() {
+        return Err(anyhow!("Expired"));
     }
 
+    return Ok(val.res);
 }
 
 fn get_or_prompt_auth_info() -> Settings {
-
-    match resolve_file("auth_info") {
-        Ok(file) => match read_file(file) {
-            Ok(contents) => match json::decode(&*contents) {
-                Ok(json_contents) => {
-                    json_contents
-                },
-                Err(_) => prompt_and_save_auth_info()
-            },
-            Err(_) => prompt_and_save_auth_info()
-        },
-        Err(_) => prompt_and_save_auth_info()
+    match std::fs::File::open("auth_info")
+        .map_err(Error::from)
+        .and_then(|val| serde_json::from_reader(val).map_err(Error::from))
+    {
+        Ok(settings) => settings,
+        Err(_err) => prompt_and_save_auth_info(),
     }
 }
 
 fn prompt_and_save_auth_info() -> Settings {
-
     let auth_info = Settings {
-        client_id : prompt_for("client_id"),
-        client_secret : prompt_for("client_secret"),
-        username : prompt_for("username (email)"),
-        password : prompt_for("password"),
-        duration_minutes: prompt_for("minimum song duration (in minutes)")
+        client_id: prompt_for("client_id"),
+        client_secret: prompt_for("client_secret"),
+        username: prompt_for("username (email)"),
+        password: prompt_for("password"),
+        duration_minutes: prompt_for("minimum song duration (in minutes)"),
     };
 
-    let file_contents = json::encode(&auth_info).unwrap();
-    let mut f = File::create("auth_info").unwrap();
-    f.write_all(file_contents.as_bytes()).unwrap();
+    let f = std::fs::File::create("auth_info").unwrap();
 
-    match resolve_file("auth_response") {
-        Ok(_) => fs::remove_file("auth_response").unwrap(),
-        Err(_) => ()
-    }
+    serde_json::to_writer(f, &auth_info).unwrap();
 
     auth_info
 }
 
 fn prompt_for(field: &str) -> String {
-    let stdin = io::stdin();
+    let stdin = std::io::stdin();
 
     println!("Please enter your {}:", field);
 
     let mut output = String::new();
     let mut input = String::new();
-    match stdin.read_line(&mut input) {
-        Ok(_) => {
-            output = format!("{}", input.trim());
-        }
-        Err(_) => ()
+    if stdin.read_line(&mut input).is_ok() {
+        output = input.trim().to_string();
     }
 
     output
 }
 
-fn download_song(access_token: &str, song: &SoundObject) {
-
+async fn download_song(access_token: &str, song: &SoundObject) -> Result<()> {
     let download_or_stream = match song.downloadable {
-        Some(can_download) => {
-                match can_download {
-                    true => "download",
-                    false => "stream"
-                }
-            },
-        None => "stream"
+        Some(can_download) => match can_download {
+            true => "download",
+            false => "stream",
+        },
+        None => "stream",
     };
 
-    let url = format!("https://api.soundcloud.com/tracks/{}/{}?oauth_token={}", song.id, download_or_stream, access_token);
+    let url = format!(
+        "https://api.soundcloud.com/tracks/{}/{}?oauth_token={}",
+        song.id, download_or_stream, access_token
+    );
 
     let file_name = get_song_path(&song);
 
-    download_to_file(&url, &file_name);
+    download_to_file(&url, &file_name).await?;
 
-    let mut tag = Tag::with_version(3);
+    let mut tag = Tag::new();
     tag.set_title(song.title.clone());
     tag.set_artist(song.user.username.clone());
 
-    match song.artwork_url {
-       Some(ref url) => {
-           let larger_url = url.replace("large.jpg", "t500x500.jpg");
+    if let Some(ref url) = song.artwork_url {
+        let larger_url = url.replace("large.jpg", "t500x500.jpg");
 
-           // Create a client.
-           let client = get_client();
-           let mut res = client.get(&*larger_url)
-                               .send()
-                               .unwrap();
+        // Create a client.
+        let client = reqwest::Client::new();
+        let res = client.get(larger_url).send().await?;
+        let buf = res.bytes().await?;
 
-           let mut buf: Vec<u8> = Vec::new();
-
-           io::copy(&mut res, &mut buf).unwrap();
-
-           tag.add_picture("image/jpeg", CoverFront, buf);
-       },
-       None => ()
+        tag.add_picture(Picture {
+            mime_type: "image/jpeg".into(),
+            picture_type: PictureType::CoverFront,
+            description: "".into(),
+            data: buf.to_vec(),
+        });
     };
 
     let album = format!("{} - {}", song.user.username, song.title);
 
     tag.set_album(album);
 
-    tag.write_to_path(file_name).unwrap();
+    tokio::task::spawn_blocking(move || tag.write_to_path(file_name, id3::Version::Id3v24))
+        .await??;
+
+    Ok(())
 }
 
-fn download_to_file(url: &str, file_name: &str) {
+async fn download_to_file(url: &str, file_name: &str) -> Result<()> {
+    let out_file = File::create(file_name).await?;
 
-    let mut file_handle = File::create(file_name.clone()).unwrap();
+    let mut file_handle = BufWriter::new(out_file);
 
     // Create a client.
-    let client = get_client();
+    let client = reqwest::Client::new();
 
-    let mut res = client.get(url)
-                        .send()
-                        .unwrap();
+    let mut res = client.get(url).send().await?;
 
-    io::copy(&mut res, &mut file_handle).unwrap();
+    while let Some(chunk) = res.chunk().await? {
+        file_handle.write_all(&chunk).await?;
+    }
 
+    file_handle.flush().await?;
+
+    Ok(())
 }
 
 fn display_song(song: &SoundObject) {
-    print!("[{}] {} [{}]", BrightGreen.bold().paint(song.user.username.clone()), BrightCyan.paint(song.title.clone()), BrightBlue.paint(format_time(song.duration)))
+    print!(
+        "[{}] {} [{}]",
+        BrightGreen.bold().paint(song.user.username.clone()),
+        BrightCyan.paint(song.title.clone()),
+        BrightBlue.paint(format_time(song.duration)),
+    )
 }
 
 fn get_song_path(song: &SoundObject) -> String {
-
     let re_trimmer = Regex::new("[\\|/<>:\"?*]").unwrap();
 
     let trimmed_title = re_trimmer.replace_all(&*song.title, "");
@@ -296,51 +300,39 @@ fn get_song_path(song: &SoundObject) -> String {
 
     let seperator = match cfg!(target_os = "windows") {
         true => "\\",
-        false => "/"
+        false => "/",
     };
 
     let year = &song.created_at[0..4];
     let month = &song.created_at[5..7];
 
-    format!("{}{}{}{}{} - {}.mp3", year, seperator, month, seperator, trimmed_username, trimmed_title)
+    format!(
+        "{}{}{}{}{} - {}.mp3",
+        year, seperator, month, seperator, trimmed_username, trimmed_title
+    )
 }
 
-fn create_parent_dirs(file: &str) {
+async fn create_parent_dirs(file: &str) -> Result<()> {
     let path = Path::new(file);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::create_dir_all(path.parent().ok_or_else(|| anyhow!("No Parent Path"))?).await?;
+
+    Ok(())
 }
 
 fn format_time(time_ms: i64) -> String {
-
     let hours = time_ms / 3600000;
     let minutes = (time_ms / 60000) % 60;
     let seconds = (time_ms / 1000) % 60;
 
-    return format!("{:02}:{:02}:{:02}",hours, minutes, seconds);
+    return format!("{:02}:{:02}:{:02}", hours, minutes, seconds);
 }
 
-fn read_file(mut file: File) -> Result<String> {
-    let mut s = String::new();
-    match file.read_to_string(&mut s) {
-        Ok(_) => Ok(s),
-        Err(_) => Err(Error::new(ErrorKind::InvalidInput,
-                      "the file cannot be read"))
-    }
-}
-
-fn resolve_file(search_path: &str) -> Result<File> {
-    let path = Path::new(search_path);
-    match path.exists(){
-        true => File::open(&path),
-        false => { Err(Error::new(ErrorKind::NotFound,
-            "the file cannot be found")) }
-        }
-}
-
-fn get_songs(access_token: &str, duration_limit_ms: i64) -> Vec<SoundObject> {
-
+async fn get_songs(access_token: &str, duration_limit_ms: i64) -> Result<Vec<SoundObject>> {
     //max limit is 319???
-    let activity_url = format!("https://api.soundcloud.com/me/activities?limit=200&oauth_token={}", access_token);
+    let activity_url = format!(
+        "https://api.soundcloud.com/me/activities?limit=200&oauth_token={}",
+        access_token
+    );
 
     //Filter out duplicates
     let mut processed_songs: HashSet<i64> = HashSet::new();
@@ -348,79 +340,66 @@ fn get_songs(access_token: &str, duration_limit_ms: i64) -> Vec<SoundObject> {
     println!("Downloading Activity Feed");
 
     // Create a client.
-    let client = get_client();
+    let client = reqwest::Client::new();
 
     // Creating an outgoing request.
-    let mut res = client.get(&activity_url)
-                        .send()
-                        .unwrap();
+    let res = client.get(&activity_url).send().await?;
 
-    let mut body = String::new();
-    res.read_to_string(&mut body).unwrap();
-
-    let activity_feed: Activities = match json::decode(&*body) {
-        Ok(json) => json,
-        Err(why) => panic!("Could not parse activity feed: {:?}", why)
-    };
+    let activity_feed: Activities = res.json().await?;
 
     let mut songs: Vec<SoundObject> = Vec::new();
 
     for collection_info in activity_feed.collection {
-
-        match collection_info.origin {
-            Some(song) => {
-                if song.duration >= duration_limit_ms && !processed_songs.contains(&song.id) && song.kind == "track" {
-
-                    processed_songs.insert(song.id);
-                    songs.push(song);
-                } else {
-                    print!("Skipping: ");
-                    display_song(&song);
-                    print!(" ({})\n", song.kind);
-                }
+        if let Some(song) = collection_info.origin {
+            if song.duration >= duration_limit_ms
+                && !processed_songs.contains(&song.id)
+                && song.kind == "track"
+            {
+                processed_songs.insert(song.id);
+                songs.push(song);
+            } else {
+                print!("Skipping: ");
+                display_song(&song);
+                println!(" ({})", song.kind);
             }
-            None => ()
         }
     }
 
-    return songs;
+    return Ok(songs);
 }
 
-fn get_and_save_auth_token(auth: Settings) -> AuthReponse {
-
+async fn get_and_save_auth_token(auth: Settings) -> Result<AuthReponse> {
+    let client = reqwest::Client::new();
     // Create a client.
-    let client = get_client();
 
     let url = "https://api.soundcloud.com/oauth2/token";
 
-    let request =  &*format!("client_id={}&client_secret={}&grant_type=password&username={}&password={}", auth.client_id, auth.client_secret, auth.username, auth.password);
+    let request = format!(
+        "client_id={}&client_secret={}&grant_type=password&username={}&password={}",
+        auth.client_id, auth.client_secret, auth.username, auth.password
+    );
 
     // Creating an outgoing request.
-    let mut res = client.post(url)
-                        .header(ContentType::form_url_encoded())
-                        .body(request)
-                        .send()
-                        .unwrap();
+    let res = client
+        .post(url)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(request)
+        .send()
+        .await?;
 
-    // Read the Response.
-    let mut body = String::new();
-    res.read_to_string(&mut body).unwrap();
+    println!("Status:{}", res.status());
 
-    let mut f = File::create("auth_response").unwrap();
+    let json: AuthReponse = res.json().await?;
 
+    let mut f = File::create("auth_response").await?;
 
-    f.write_all(body.as_bytes()).unwrap();
+    let saved_auth_response = SavedAuthReponse {
+        res: json.clone(),
+        date: Local::now(),
+    };
 
-    println!("Status:{}", res.status);
+    f.write_all(&serde_json::to_vec(&saved_auth_response)?)
+        .await?;
 
-    return json::decode(&*body).unwrap();
-
-}
-
-fn get_client() -> Client {
-    let ssl = NativeTlsClient::new().unwrap();
-    let connector = HttpsConnector::new(ssl);
-
-    Client::with_connector(connector)
-
+    return Ok(json);
 }
