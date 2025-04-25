@@ -1,47 +1,37 @@
 use std::path::Path;
+use std::sync::LazyLock;
+use std::thread::available_parallelism;
 
-use chrono::DateTime;
 use id3::frame::Picture;
 use id3::frame::PictureType;
+use id3::Tag;
+use id3::TagLike;
 use regex::Regex;
 use std::collections::HashSet;
 
 use futures::stream::{self, StreamExt, TryStreamExt};
-use tokio::fs::{self, File};
-use tokio::io::AsyncWriteExt;
-use tokio::io::BufWriter;
+use tokio::fs::{self};
 
 use anyhow::{anyhow, Error, Result};
-
-use chrono::Local;
-use id3::Tag;
 
 use serde::{Deserialize, Serialize};
 
 use term_painter::Color::*;
 use term_painter::ToStyle;
 
-#[derive(Deserialize, Serialize, Clone)]
-pub struct AuthReponse {
-    access_token: String,
-    expires_in: i64,
-}
-#[derive(Deserialize, Serialize)]
-pub struct SavedAuthReponse {
-    res: AuthReponse,
-    date: DateTime<Local>,
-}
+use gst::prelude::*;
+use gstreamer as gst;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UserDetails {
     id: i64,
     username: String,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct SoundObject {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Track {
     id: i64,
-    duration: i64,
+    duration: usize,
     title: String,
     permalink_url: String,
     downloadable: Option<bool>,
@@ -51,11 +41,29 @@ pub struct SoundObject {
     stream_url: Option<String>,
     created_at: String,
     kind: String,
+    media: Media,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TranscodingFormat {
+    protocol: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Transcoding {
+    url: String,
+    preset: String,
+    format: TranscodingFormat,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Media {
+    transcodings: Vec<Transcoding>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct CollectionInfo {
-    origin: Option<SoundObject>,
+    track: Option<Track>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -65,115 +73,94 @@ pub struct Activities {
 
 #[derive(Serialize, Deserialize)]
 pub struct Settings {
-    username: String,
-    password: String,
     client_id: String,
-    client_secret: String,
-    duration_minutes: String,
+    oauth_token: String,
+    duration_minutes: usize,
+    // Change this if you always wanna download a few tracks
+    #[serde(default)]
+    min_tracks: usize,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    gst::init()?;
+
     let auth_info = get_or_prompt_auth_info();
 
-    let duration_minutes: i64 = auth_info.duration_minutes.parse().unwrap();
+    let duration_limit_ms = auth_info.duration_minutes * 60000;
 
-    let auth = match get_auth_response().await {
-        Ok(val) => val,
-        Err(err) => {
-            println!("{}", err);
-            get_and_save_auth_token(auth_info).await?
+    // For going back in time! gotta do this as a cli arg
+    let mut tracks = Vec::new();
+
+    let limit = 100;
+    let mut offset = 0;
+
+    //Filter out duplicates
+    let mut processed_tracks: HashSet<i64> = HashSet::new();
+
+    loop {
+        let tracks_list = get_tracks(
+            &auth_info.oauth_token,
+            &auth_info.client_id,
+            duration_limit_ms,
+            limit,
+            offset,
+            &mut processed_tracks,
+        )
+        .await?;
+
+        tracks.extend(tracks_list);
+
+        offset += limit - 1;
+
+        if tracks.len() >= auth_info.min_tracks {
+            break;
         }
-    };
+    }
 
-    let duration_limit_ms = duration_minutes * 60000;
+    let num_tracks = tracks.len();
 
-    let songs = get_songs(&auth.access_token, duration_limit_ms).await?;
+    println!("Checking {} tracks", num_tracks);
 
-    let num_songs = songs.len();
-
-    println!("Checking {} songs", num_songs);
-
-    for song in songs.iter() {
-        let file_path = get_song_path(&song);
+    for track in tracks.iter() {
+        let file_path = get_track_path(track);
         create_parent_dirs(&file_path).await?;
     }
 
-    let stream = stream::iter(songs).map(|val| Ok(val) as Result<_, Error>);
+    let stream = stream::iter(tracks).map(|val| Ok(val) as Result<_, Error>);
 
-    let access_token = &*auth.access_token;
+    let oauth_token = &*auth_info.oauth_token;
 
     stream
-        .try_for_each_concurrent(4, |song| async move {
-            let file_path = get_song_path(&song);
+        .try_for_each_concurrent(available_parallelism()?.get(), |track| async move {
+            let file_path = get_track_path(&track);
 
             if fs::metadata(&file_path).await.is_ok() {
                 print!("Already Downloaded: ");
-                display_song(&song);
+                display_track(&track);
                 println!(" at: {}", file_path);
             } else {
                 print!("Downloading: ");
-                display_song(&song);
+                display_track(&track);
                 println!(" to: {}", file_path);
 
-                download_song(access_token, &song).await?;
-                print!("Finished Downloading: ");
-                display_song(&song);
-                println!();
+                if let Err(err) = download_track(oauth_token, &track).await {
+                    print!("{}", BrightRed.bold().paint("Error Downloading: "));
+                    display_track(&track);
+                    println!("Debug : {track:#?}");
+                    println!("Error: {err:?}");
+                } else {
+                    print!("Finished Downloading: ");
+                    display_track(&track);
+                    println!();
+                }
             }
 
             Ok(())
         })
         .await?;
 
-    /*
-
-    for song in songs.into_iter() {
-        let access_token = auth.access_token.clone();
-
-        //Create dirs before multi-thread to avoid conflicts
-        let file_path = get_song_path(&song);
-        create_parent_dirs(&file_path);
-
-        let tx = tx.clone();
-
-        pool.execute(move || {
-            match resolve_file(&file_path) {
-                Ok(_) => {
-                    print!("Already Downloaded: ");
-                    display_song(&song);
-                    print!(" at: {}\n", file_path);
-                }
-                Err(_) => {
-                    print!("Downloading: ");
-                    display_song(&song);
-                    print!(" to: {}\n", file_path);
-
-                    download_song(&access_token, &song);
-                    print!("Finished Downloading: ");
-                    display_song(&song);
-                    print!("\n");
-                }
-            };
-
-            tx.send(()).unwrap();
-        });
-    }
-    */
-
     Ok(())
-}
-
-async fn get_auth_response() -> Result<AuthReponse> {
-    let contents = fs::read_to_string("auth_response").await?;
-
-    let val: SavedAuthReponse = serde_json::from_str(&contents)?;
-
-    if (val.date.timestamp() + val.res.expires_in) < Local::now().timestamp() {
-        return Err(anyhow!("Expired"));
-    }
-
-    return Ok(val.res);
 }
 
 fn get_or_prompt_auth_info() -> Settings {
@@ -189,10 +176,11 @@ fn get_or_prompt_auth_info() -> Settings {
 fn prompt_and_save_auth_info() -> Settings {
     let auth_info = Settings {
         client_id: prompt_for("client_id"),
-        client_secret: prompt_for("client_secret"),
-        username: prompt_for("username (email)"),
-        password: prompt_for("password"),
-        duration_minutes: prompt_for("minimum song duration (in minutes)"),
+        oauth_token: prompt_for("oauth_token"),
+        duration_minutes: prompt_for("minimum track duration (in minutes)")
+            .parse()
+            .expect("duration is not a number"),
+        min_tracks: 0,
     };
 
     let f = std::fs::File::create("auth_info").unwrap();
@@ -216,95 +204,160 @@ fn prompt_for(field: &str) -> String {
     output
 }
 
-async fn download_song(access_token: &str, song: &SoundObject) -> Result<()> {
-    let download_or_stream = match song.downloadable {
-        Some(can_download) => match can_download {
-            true => "download",
-            false => "stream",
-        },
-        None => "stream",
-    };
+#[derive(Serialize, Deserialize)]
+struct HlsResponse {
+    url: String,
+}
 
-    let url = format!(
-        "https://api.soundcloud.com/tracks/{}/{}?oauth_token={}",
-        song.id, download_or_stream, access_token
-    );
+const DECODE_PRIORITY: [&str; 4] = ["aac_256k", "aac_160k", "aac_", "mp3_"];
 
-    let file_name = get_song_path(&song);
+fn sort_by_priority(items: &mut [Transcoding]) {
+    items.sort_unstable_by(|a, b| {
+        let pos_a = DECODE_PRIORITY
+            .iter()
+            .position(|p| a.preset.starts_with(*p))
+            .unwrap_or(usize::MAX);
 
-    download_to_file(&url, &file_name).await?;
+        let pos_b = DECODE_PRIORITY
+            .iter()
+            .position(|p| b.preset.starts_with(*p))
+            .unwrap_or(usize::MAX);
+
+        pos_a.cmp(&pos_b)
+    });
+}
+
+async fn download_track(oauth_token: &str, track: &Track) -> Result<()> {
+    let client = reqwest::Client::new();
+
+    let mut transcodings = track.media.transcodings.clone();
+    sort_by_priority(&mut transcodings);
+
+    let hls_stream = transcodings
+        .first()
+        .ok_or_else(|| anyhow!("Found no media transcodings"))?;
+
+    let res = client
+        .get(&hls_stream.url)
+        .header("Authorization", format!("OAuth {oauth_token}"))
+        .send()
+        .await?;
+
+    let hls_response: HlsResponse = res.json().await?;
+
+    let file_name = get_track_path(track);
+
+    let temp_filename = format!("{file_name}.tmp");
+    let temp_dl = temp_filename.clone();
+
+    tokio::task::spawn_blocking(move || download_to_file(&hls_response.url, &temp_dl)).await??;
 
     let mut tag = Tag::new();
-    tag.set_title(song.title.clone());
-    tag.set_artist(song.user.username.clone());
+    tag.set_title(track.title.clone());
+    tag.set_artist(track.user.username.clone());
+    tag.set_duration(track.duration as u32);
 
-    if let Some(ref url) = song.artwork_url {
-        let larger_url = url.replace("large.jpg", "t500x500.jpg");
+    if let Some(ref url) = track.artwork_url {
+        let larger_url = url.replace("-large.", "-t500x500.");
 
-        // Create a client.
-        let client = reqwest::Client::new();
-        let res = client.get(larger_url).send().await?;
+        let res = client.get(&larger_url).send().await?;
         let buf = res.bytes().await?;
 
-        tag.add_picture(Picture {
-            mime_type: "image/jpeg".into(),
+        tag.add_frame(Picture {
+            mime_type: if larger_url.ends_with("png") {
+                "image/png".into()
+            } else {
+                "image/jpeg".into()
+            },
             picture_type: PictureType::CoverFront,
             description: "".into(),
             data: buf.to_vec(),
         });
     };
 
-    let album = format!("{} - {}", song.user.username, song.title);
+    let album = format!("{} - {}", track.user.username, track.title);
 
     tag.set_album(album);
 
-    tokio::task::spawn_blocking(move || tag.write_to_path(file_name, id3::Version::Id3v24))
+    let temp_tag = temp_filename.clone();
+
+    tokio::task::spawn_blocking(move || tag.write_to_path(temp_tag, id3::Version::Id3v24))
         .await??;
 
+    tokio::fs::rename(temp_filename, file_name).await?;
+
     Ok(())
 }
 
-async fn download_to_file(url: &str, file_name: &str) -> Result<()> {
-    let out_file = File::create(file_name).await?;
+fn download_to_file(url: &str, file_name: &str) -> Result<()> {
+    let pipeline_str = format!(
+        "
+        souphttpsrc location=\"{url}\" !
+        hlsdemux !
+        decodebin !
+        audioconvert !
+        audioresample !
+        lamemp3enc target=1 bitrate=256 cbr=false !
+        filesink location=\"{file_name}\"
+        "
+    );
 
-    let mut file_handle = BufWriter::new(out_file);
+    let pipeline = gst::parse::launch(&pipeline_str)?;
 
-    // Create a client.
-    let client = reqwest::Client::new();
+    let pipeline = pipeline.dynamic_cast::<gst::Pipeline>().unwrap();
 
-    let mut res = client.get(url).send().await?;
+    // Get the bus
+    let bus = pipeline.bus().unwrap();
 
-    while let Some(chunk) = res.chunk().await? {
-        file_handle.write_all(&chunk).await?;
+    pipeline.set_state(gst::State::Playing)?;
+
+    while let Some(msg) = bus.timed_pop(gst::ClockTime::NONE) {
+        use gst::MessageView;
+
+        match msg.view() {
+            MessageView::Eos(..) => {
+                break;
+            }
+            MessageView::Error(err) => {
+                pipeline.set_state(gst::State::Null)?;
+                return Err(anyhow!(
+                    "Error from {:?}: {} ({:?})",
+                    err.src().map(|s| s.path_string()),
+                    err.error(),
+                    err.debug()
+                ));
+            }
+            _ => {}
+        }
     }
 
-    file_handle.flush().await?;
+    pipeline.set_state(gst::State::Null)?;
 
     Ok(())
 }
 
-fn display_song(song: &SoundObject) {
+fn display_track(track: &Track) {
     print!(
         "[{}] {} [{}]",
-        BrightGreen.bold().paint(song.user.username.clone()),
-        BrightCyan.paint(song.title.clone()),
-        BrightBlue.paint(format_time(song.duration)),
+        BrightGreen.bold().paint(track.user.username.clone()),
+        BrightCyan.paint(track.title.clone()),
+        BrightBlue.paint(format_time(track.duration)),
     )
 }
 
-fn get_song_path(song: &SoundObject) -> String {
-    let re_trimmer = Regex::new("[\\|/<>:\"?*]").unwrap();
+static RE_TRIMMER: LazyLock<Regex> = LazyLock::new(|| Regex::new("[\\|/<>:\"?*]").unwrap());
 
-    let trimmed_title = re_trimmer.replace_all(&*song.title, "");
-    let trimmed_username = re_trimmer.replace_all(&*song.user.username, "");
+fn get_track_path(track: &Track) -> String {
+    let trimmed_title = RE_TRIMMER.replace_all(&track.title, "");
+    let trimmed_username = RE_TRIMMER.replace_all(&track.user.username, "");
 
     let seperator = match cfg!(target_os = "windows") {
         true => "\\",
         false => "/",
     };
 
-    let year = &song.created_at[0..4];
-    let month = &song.created_at[5..7];
+    let year = &track.created_at[0..4];
+    let month = &track.created_at[5..7];
 
     format!(
         "{}{}{}{}{} - {}.mp3",
@@ -319,87 +372,66 @@ async fn create_parent_dirs(file: &str) -> Result<()> {
     Ok(())
 }
 
-fn format_time(time_ms: i64) -> String {
+fn format_time(time_ms: usize) -> String {
     let hours = time_ms / 3600000;
     let minutes = (time_ms / 60000) % 60;
     let seconds = (time_ms / 1000) % 60;
 
-    return format!("{:02}:{:02}:{:02}", hours, minutes, seconds);
+    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
 }
 
-async fn get_songs(access_token: &str, duration_limit_ms: i64) -> Result<Vec<SoundObject>> {
+async fn get_tracks(
+    oauth_token: &str,
+    client_id: &str,
+    duration_limit_ms: usize,
+    limit: usize,
+    offset: usize,
+    processed_tracks: &mut HashSet<i64>,
+) -> Result<Vec<Track>> {
     //max limit is 319???
     let activity_url = format!(
-        "https://api.soundcloud.com/me/activities?limit=200&oauth_token={}",
-        access_token
+        "https://api-v2.soundcloud.com/stream?client_id={client_id}&limit={limit}&offset={offset}"
     );
 
-    //Filter out duplicates
-    let mut processed_songs: HashSet<i64> = HashSet::new();
-
-    println!("Downloading Activity Feed");
+    println!("Downloading Activity Feed. Offset {offset}");
 
     // Create a client.
     let client = reqwest::Client::new();
 
     // Creating an outgoing request.
-    let res = client.get(&activity_url).send().await?;
+    let res = client
+        .get(&activity_url)
+        .header("Authorization", format!("OAuth {oauth_token}"))
+        .send()
+        .await?;
 
     let activity_feed: Activities = res.json().await?;
 
-    let mut songs: Vec<SoundObject> = Vec::new();
+    let mut tracks: Vec<Track> = Vec::new();
 
     for collection_info in activity_feed.collection {
-        if let Some(song) = collection_info.origin {
-            if song.duration >= duration_limit_ms
-                && !processed_songs.contains(&song.id)
-                && song.kind == "track"
+        if let Some(track) = collection_info.track {
+            if track.duration >= duration_limit_ms
+                && !processed_tracks.contains(&track.id)
+                && track.kind == "track"
             {
-                processed_songs.insert(song.id);
-                songs.push(song);
+                let file_path = get_track_path(&track);
+
+                if fs::metadata(&file_path).await.is_ok() {
+                    print!("Already Downloaded: ");
+                    display_track(&track);
+                    println!(" at: {}", file_path);
+                } else {
+                    processed_tracks.insert(track.id);
+                    tracks.push(track);
+                }
             } else {
                 print!("Skipping: ");
-                display_song(&song);
-                println!(" ({})", song.kind);
+                display_track(&track);
+                println!(" ({})", track.kind);
             }
         }
     }
 
-    return Ok(songs);
-}
-
-async fn get_and_save_auth_token(auth: Settings) -> Result<AuthReponse> {
-    let client = reqwest::Client::new();
-    // Create a client.
-
-    let url = "https://api.soundcloud.com/oauth2/token";
-
-    let request = format!(
-        "client_id={}&client_secret={}&grant_type=password&username={}&password={}",
-        auth.client_id, auth.client_secret, auth.username, auth.password
-    );
-
-    // Creating an outgoing request.
-    let res = client
-        .post(url)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(request)
-        .send()
-        .await?;
-
-    println!("Status:{}", res.status());
-
-    let json: AuthReponse = res.json().await?;
-
-    let mut f = File::create("auth_response").await?;
-
-    let saved_auth_response = SavedAuthReponse {
-        res: json.clone(),
-        date: Local::now(),
-    };
-
-    f.write_all(&serde_json::to_vec(&saved_auth_response)?)
-        .await?;
-
-    return Ok(json);
+    Ok(tracks)
 }
