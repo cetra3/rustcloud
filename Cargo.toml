@@ -6,15 +6,15 @@ description = "Downloads tracks from soundcloud"
 edition = "2024"
 
 [dependencies]
-serde = { version = "1", features = ["derive"]}
-anyhow = "1.0.40"
+serde = { version = "1", features = ["derive"] }
+anyhow = { version = "1.0.40", features = ["backtrace"] }
 term-painter = "0.4.0"
-id3 = "1.16.2"
-chrono = {version = "0.4.11", features = ["serde"] }
+chrono = { version = "0.4.11", features = ["serde"] }
 regex = "*"
 
 reqwest = { version = "0.12", features = ["json"] }
-tokio = { version = "1.6.1", features = ["full"]}
+tokio = { version = "1.6.1", features = ["full"] }
 serde_json = "1.0.64"
 futures = "0.3.15"
 gstreamer = "0.23.5"
+audiotags = { git = "https://github.com/cetra3/audiotags.git", branch = "add_create_new" }

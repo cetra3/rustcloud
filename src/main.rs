@@ -2,17 +2,15 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::thread::available_parallelism;
 
-use id3::frame::Picture;
-use id3::frame::PictureType;
-use id3::Tag;
-use id3::TagLike;
+use audiotags::TagType;
 use regex::Regex;
 use std::collections::HashSet;
 
+use audiotags::{MimeType, Picture, Tag};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use tokio::fs::{self};
 
-use anyhow::{anyhow, Error, Result};
+use anyhow::{Error, Result, anyhow};
 
 use serde::{Deserialize, Serialize};
 
@@ -123,7 +121,7 @@ async fn main() -> Result<(), Error> {
     println!("Checking {} tracks", num_tracks);
 
     for track in tracks.iter() {
-        let file_path = get_track_path(track);
+        let file_path = get_track_path(track, false);
         create_parent_dirs(&file_path).await?;
     }
 
@@ -133,7 +131,7 @@ async fn main() -> Result<(), Error> {
 
     stream
         .try_for_each_concurrent(available_parallelism()?.get(), |track| async move {
-            let file_path = get_track_path(&track);
+            let file_path = get_track_path(&track, false);
 
             if fs::metadata(&file_path).await.is_ok() {
                 print!("Already Downloaded: ");
@@ -245,17 +243,26 @@ async fn download_track(oauth_token: &str, track: &Track) -> Result<()> {
 
     let hls_response: HlsResponse = res.json().await?;
 
-    let file_name = get_track_path(track);
+    let file_name = get_track_path(track, false);
 
-    let temp_filename = format!("{file_name}.tmp");
+    let temp_filename = get_track_path(track, true);
     let temp_dl = temp_filename.clone();
 
     tokio::task::spawn_blocking(move || download_to_file(&hls_response.url, &temp_dl)).await??;
 
-    let mut tag = Tag::new();
-    tag.set_title(track.title.clone());
-    tag.set_artist(track.user.username.clone());
-    tag.set_duration(track.duration as u32);
+    let tag_type = if hls_stream.preset.starts_with("aac") {
+        TagType::Mp4
+    } else {
+        TagType::Id3v2
+    };
+
+    let tag = Tag::new().with_tag_type(tag_type);
+
+    let mut tag = tag
+        .read_from_path(&temp_filename)
+        .or_else(|_| tag.create_new())?;
+    tag.set_title(&track.title);
+    tag.set_artist(&track.user.username);
 
     if let Some(ref url) = track.artwork_url {
         let larger_url = url.replace("-large.", "-t500x500.");
@@ -263,26 +270,25 @@ async fn download_track(oauth_token: &str, track: &Track) -> Result<()> {
         let res = client.get(&larger_url).send().await?;
         let buf = res.bytes().await?;
 
-        tag.add_frame(Picture {
+        let cover = Picture {
             mime_type: if larger_url.ends_with("png") {
-                "image/png".into()
+                MimeType::Png
             } else {
-                "image/jpeg".into()
+                MimeType::Jpeg
             },
-            picture_type: PictureType::CoverFront,
-            description: "".into(),
-            data: buf.to_vec(),
-        });
+            data: &*buf,
+        };
+
+        tag.set_album_cover(cover);
     };
 
     let album = format!("{} - {}", track.user.username, track.title);
 
-    tag.set_album(album);
+    tag.set_album_title(&album);
 
     let temp_tag = temp_filename.clone();
 
-    tokio::task::spawn_blocking(move || tag.write_to_path(temp_tag, id3::Version::Id3v24))
-        .await??;
+    tokio::task::spawn_blocking(move || tag.write_to_path(&temp_tag)).await??;
 
     tokio::fs::rename(temp_filename, file_name).await?;
 
@@ -294,10 +300,6 @@ fn download_to_file(url: &str, file_name: &str) -> Result<()> {
         "
         souphttpsrc location=\"{url}\" !
         hlsdemux !
-        decodebin !
-        audioconvert !
-        audioresample !
-        lamemp3enc target=1 bitrate=256 cbr=false !
         filesink location=\"{file_name}\"
         "
     );
@@ -347,7 +349,7 @@ fn display_track(track: &Track) {
 
 static RE_TRIMMER: LazyLock<Regex> = LazyLock::new(|| Regex::new("[\\|/<>:\"?*]").unwrap());
 
-fn get_track_path(track: &Track) -> String {
+fn get_track_path(track: &Track, temp: bool) -> String {
     let trimmed_title = RE_TRIMMER.replace_all(&track.title, "");
     let trimmed_username = RE_TRIMMER.replace_all(&track.user.username, "");
 
@@ -356,12 +358,25 @@ fn get_track_path(track: &Track) -> String {
         false => "/",
     };
 
+    let mut transcodings = track.media.transcodings.clone();
+    sort_by_priority(&mut transcodings);
+
+    let suffix = if transcodings
+        .first()
+        .is_some_and(|val| val.preset.starts_with("aac"))
+    {
+        "m4a"
+    } else {
+        "mp3"
+    };
+
+    let temp = if temp { "__tmp" } else { "" };
+
     let year = &track.created_at[0..4];
     let month = &track.created_at[5..7];
 
     format!(
-        "{}{}{}{}{} - {}.mp3",
-        year, seperator, month, seperator, trimmed_username, trimmed_title
+        "{year}{seperator}{month}{seperator}{trimmed_username} - {trimmed_title}{temp}.{suffix}",
     )
 }
 
@@ -415,7 +430,7 @@ async fn get_tracks(
                 && !processed_tracks.contains(&track.id)
                 && track.kind == "track"
             {
-                let file_path = get_track_path(&track);
+                let file_path = get_track_path(&track, false);
 
                 if fs::metadata(&file_path).await.is_ok() {
                     print!("Already Downloaded: ");
