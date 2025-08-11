@@ -3,6 +3,8 @@ use std::sync::LazyLock;
 use std::thread::available_parallelism;
 
 use audiotags::TagType;
+use chrono::DateTime;
+use chrono::Utc;
 use regex::Regex;
 use std::collections::HashSet;
 
@@ -61,7 +63,13 @@ pub struct Media {
 
 #[derive(Serialize, Deserialize)]
 pub struct CollectionInfo {
+    created_at: DateTime<Utc>,
     track: Option<Track>,
+}
+
+pub struct TrackResponse {
+    earliest_date: DateTime<Utc>,
+    tracks: Vec<Track>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -74,9 +82,8 @@ pub struct Settings {
     client_id: String,
     oauth_token: String,
     duration_minutes: usize,
-    // Change this if you always wanna download a few tracks
-    #[serde(default)]
-    min_tracks: usize,
+    #[serde(default = "Utc::now")]
+    last_date_seen: DateTime<Utc>,
 }
 
 #[tokio::main]
@@ -97,7 +104,7 @@ async fn main() -> Result<(), Error> {
     let mut processed_tracks: HashSet<i64> = HashSet::new();
 
     loop {
-        let tracks_list = get_tracks(
+        let track_response = get_tracks(
             &auth_info.oauth_token,
             &auth_info.client_id,
             duration_limit_ms,
@@ -107,11 +114,11 @@ async fn main() -> Result<(), Error> {
         )
         .await?;
 
-        tracks.extend(tracks_list);
+        tracks.extend(track_response.tracks);
 
         offset += limit - 1;
 
-        if tracks.len() >= auth_info.min_tracks {
+        if track_response.earliest_date <= auth_info.last_date_seen {
             break;
         }
     }
@@ -158,6 +165,16 @@ async fn main() -> Result<(), Error> {
         })
         .await?;
 
+    let new_info = Settings {
+        client_id: auth_info.client_id.clone(),
+        oauth_token: auth_info.oauth_token.clone(),
+        duration_minutes: auth_info.duration_minutes,
+        last_date_seen: Utc::now(),
+    };
+
+    let f = std::fs::File::create("auth_info")?;
+    serde_json::to_writer(f, &new_info)?;
+
     Ok(())
 }
 
@@ -178,7 +195,7 @@ fn prompt_and_save_auth_info() -> Settings {
         duration_minutes: prompt_for("minimum track duration (in minutes)")
             .parse()
             .expect("duration is not a number"),
-        min_tracks: 0,
+        last_date_seen: Utc::now(),
     };
 
     let f = std::fs::File::create("auth_info").unwrap();
@@ -402,7 +419,7 @@ async fn get_tracks(
     limit: usize,
     offset: usize,
     processed_tracks: &mut HashSet<i64>,
-) -> Result<Vec<Track>> {
+) -> Result<TrackResponse> {
     //max limit is 319???
     let activity_url = format!(
         "https://api-v2.soundcloud.com/stream?client_id={client_id}&limit={limit}&offset={offset}"
@@ -422,9 +439,15 @@ async fn get_tracks(
 
     let activity_feed: Activities = res.json().await?;
 
+    let mut earliest_date_seen = Utc::now();
+
     let mut tracks: Vec<Track> = Vec::new();
 
     for collection_info in activity_feed.collection {
+        if collection_info.created_at < earliest_date_seen {
+            earliest_date_seen = collection_info.created_at;
+        }
+
         if let Some(track) = collection_info.track {
             if track.duration >= duration_limit_ms
                 && !processed_tracks.contains(&track.id)
@@ -448,5 +471,8 @@ async fn get_tracks(
         }
     }
 
-    Ok(tracks)
+    Ok(TrackResponse {
+        earliest_date: earliest_date_seen,
+        tracks,
+    })
 }
